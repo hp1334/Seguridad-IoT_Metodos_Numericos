@@ -26,3 +26,6 @@ resultados_informe.txt
 *.respaldo
 *.respaldo/
 src.respaldo/
+
+# Credenciales y configuración local del ESP32
+esp32/**/configuracion_local.h
