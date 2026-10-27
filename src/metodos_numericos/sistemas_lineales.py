@@ -1,129 +1,76 @@
-# src/metodos_numericos/sistemas_lineales.py
-"""
-Módulo de la Unidad 3: Resolución de Sistemas de Ecuaciones Lineales.
-Incluye Gauss-Seidel, Jacobi y Eliminación Gaussiana con Pivoteo Parcial.
-"""
+"""Unidad 3: Jacobi, Gauss-Seidel, pivoteo y condicionamiento."""
+from __future__ import annotations
 import numpy as np
-from src.metodos_numericos.errores import (
-    error_absoluto,
-    error_relativo_porcentual,
-    verificar_diagonal_dominante,
-)
+from .raices import error_absoluto, error_relativo_porcentual
 
 
-def gauss_seidel(M, C, x0, tol=1e-6, max_iter=100, sol_exacta=None):
-    """
-    Resuelve el sistema lineal MX = C mediante el método iterativo de Gauss-Seidel.
+def numero_condicion_infinito(M):
+    """Número de condición de la matriz, no de las mediciones físicas."""
+    A = np.asarray(M, dtype=float)
+    try:
+        identidad=np.eye(len(A))
+        inversa=np.column_stack([eliminacion_gaussiana(A,identidad[:,i]) for i in range(len(A))])
+        return float(np.linalg.norm(A, ord=np.inf)*np.linalg.norm(inversa, ord=np.inf))
+    except (np.linalg.LinAlgError, ValueError):
+        return float('inf')
 
-    Args:
-        M (np.ndarray): Matriz cuadrada de coeficientes.
-        C (np.ndarray): Vector de términos independientes.
-        x0 (np.ndarray): Vector inicial semilla.
-        tol (float): Tolerancia de parada para el error relativo.
-        max_iter (int): Máximo de iteraciones permitidas.
-        sol_exacta (np.ndarray, optional): Solución de referencia para error verdadero.
 
-    Returns:
-        tuple: (vector_solucion, historial_iteraciones, diagnostico_dominancia)
-    """
-    n = len(C)
-    if np.any(np.abs(np.diag(M)) < 1e-15):
-        raise ZeroDivisionError("Cero detectado en la diagonal principal de la matriz M.")
+def diagonal_dominante(M):
+    A = np.asarray(M, dtype=float)
+    return bool(np.all(2*np.abs(np.diag(A)) > np.sum(np.abs(A), axis=1)))
 
-    es_dom, msg_dom = verificar_diagonal_dominante(M)
-    xk = np.array(x0, dtype=float)
-    historial = []
 
-    for k in range(1, max_iter + 1):
-        xk_nuevo = np.copy(xk)
+def _lineal(M, C, x0, tol, max_iter, referencia, modo):
+    A, b = np.asarray(M, float), np.asarray(C, float)
+    x = np.asarray(x0, float).copy()
+    n = len(b)
+    if A.shape != (n,n) or x.shape != (n,) or np.any(np.abs(np.diag(A)) < 1e-14):
+        raise ValueError('Dimensiones incorrectas o diagonal con ceros.')
+    if tol <= 0 or max_iter < 1:
+        raise ValueError('Tolerancia o iteraciones no válidas.')
+    hist = []
+    for k in range(1, max_iter+1):
+        nuevo = x.copy()
         for i in range(n):
-            suma_previa = sum(M[i][j] * xk_nuevo[j] for j in range(i))
-            suma_posterior = sum(M[i][j] * xk[j] for j in range(i + 1, n))
-            xk_nuevo[i] = (C[i] - suma_previa - suma_posterior) / M[i][i]
-
-        err_abs = error_absoluto(xk_nuevo, xk)
-        err_rel = error_relativo_porcentual(xk_nuevo, xk)
-        err_verd = error_absoluto(xk_nuevo, sol_exacta) if sol_exacta is not None else None
-
-        historial.append({
-            "iteracion": k,
-            "x": float(xk_nuevo[0]),
-            "y": float(xk_nuevo[1]),
-            "error_abs": err_abs,
-            "error_rel_pct": err_rel,
-            "error_verdadero": err_verd
-        })
-
-        if err_abs < tol:
-            return xk_nuevo, historial, (es_dom, msg_dom)
-
-        xk = xk_nuevo
-
-    raise RuntimeError(f"Gauss-Seidel no convergió tras {max_iter} iteraciones.")
+            previo = nuevo if modo == 'gs' else x
+            suma1 = np.dot(A[i,:i], previo[:i])
+            suma2 = np.dot(A[i,i+1:], x[i+1:])
+            nuevo[i] = (b[i]-suma1-suma2)/A[i,i]
+        ea = error_absoluto(nuevo, x)
+        hist.append({'iteracion':k,'aproximacion':nuevo.tolist(),
+                     'error_abs':ea,'error_rel_pct':error_relativo_porcentual(nuevo,x),
+                     'error_verdadero':error_absoluto(nuevo,referencia) if referencia is not None else None})
+        if ea <= tol and np.linalg.norm(A@nuevo-b) <= max(1.0,float(np.linalg.norm(b)))*tol:
+            return nuevo, hist
+        x = nuevo
+    raise RuntimeError(f'{modo}: no convergió en {max_iter} iteraciones.')
 
 
-def metodo_jacobi(M, C, x0, tol=1e-6, max_iter=100, sol_exacta=None):
-    """
-    Resuelve el sistema lineal MX = C mediante el método iterativo de Jacobi
-    para comparación de velocidad de convergencia frente a Gauss-Seidel.
-    """
-    n = len(C)
-    if np.any(np.abs(np.diag(M)) < 1e-15):
-        raise ZeroDivisionError("Cero detectado en la diagonal principal de la matriz M.")
-
-    xk = np.array(x0, dtype=float)
-    historial = []
-
-    for k in range(1, max_iter + 1):
-        xk_nuevo = np.zeros_like(xk)
-        for i in range(n):
-            suma = sum(M[i][j] * xk[j] for j in range(n) if j != i)
-            xk_nuevo[i] = (C[i] - suma) / M[i][i]
-
-        err_abs = error_absoluto(xk_nuevo, xk)
-        err_rel = error_relativo_porcentual(xk_nuevo, xk)
-        err_verd = error_absoluto(xk_nuevo, sol_exacta) if sol_exacta is not None else None
-
-        historial.append({
-            "iteracion": k,
-            "x": float(xk_nuevo[0]),
-            "y": float(xk_nuevo[1]),
-            "error_abs": err_abs,
-            "error_rel_pct": err_rel,
-            "error_verdadero": err_verd
-        })
-
-        if err_abs < tol:
-            return xk_nuevo, historial
-
-        xk = xk_nuevo
-
-    raise RuntimeError(f"Jacobi no convergió tras {max_iter} iteraciones.")
+def gauss_seidel(M,C,x0,tol=1e-6,max_iter=100,referencia=None):
+    return _lineal(M,C,x0,tol,max_iter,referencia,'gs')
 
 
-def eliminacion_gaussiana_pivoteo(M, C):
-    """
-    Resuelve el sistema lineal MX = C mediante Eliminación Gaussiana con Pivoteo Parcial.
-    Implementación directa para contrastar con métodos iterativos.
-    """
-    n = len(C)
-    Ab = np.hstack([M.astype(float), C.reshape(-1, 1).astype(float)])
+def jacobi(M,C,x0,tol=1e-6,max_iter=100,referencia=None):
+    return _lineal(M,C,x0,tol,max_iter,referencia,'jacobi')
 
-    # Eliminación hacia adelante con pivoteo parcial
+
+def eliminacion_gaussiana(M,C):
+    """Pivoteo parcial propio, sin recurrir a numpy.linalg.solve."""
+    A = np.asarray(M,float).copy()
+    b = np.asarray(C,float).copy()
+    n = len(b)
+    if A.shape != (n,n): raise ValueError('Sistema no cuadrado.')
     for i in range(n):
-        max_row = i + np.argmax(np.abs(Ab[i:, i]))
-        if abs(Ab[max_row, i]) < 1e-15:
-            raise ValueError("El sistema es singular o tiene infinitas soluciones.")
-        if max_row != i:
-            Ab[[i, max_row]] = Ab[[max_row, i]]
-
-        for j in range(i + 1, n):
-            factor = Ab[j, i] / Ab[i, i]
-            Ab[j, i:] -= factor * Ab[i, i:]
-
-    # Sustitución hacia atrás
-    x = np.zeros(n, dtype=float)
-    for i in range(n - 1, -1, -1):
-        x[i] = (Ab[i, -1] - np.dot(Ab[i, i + 1:n], x[i + 1:n])) / Ab[i, i]
-
+        pivote = i + int(np.argmax(np.abs(A[i:,i])))
+        if abs(A[pivote,i]) < 1e-14:
+            raise ValueError('Matriz singular.')
+        A[[i,pivote]] = A[[pivote,i]]
+        b[[i,pivote]] = b[[pivote,i]]
+        for j in range(i+1,n):
+            factor=A[j,i]/A[i,i]
+            A[j,i:]-=factor*A[i,i:]
+            b[j]-=factor*b[i]
+    x=np.zeros(n)
+    for i in range(n-1,-1,-1):
+        x[i]=(b[i]-np.dot(A[i,i+1:],x[i+1:]))/A[i,i]
     return x

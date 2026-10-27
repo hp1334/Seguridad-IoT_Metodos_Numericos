@@ -1,157 +1,144 @@
-# Seguridad IoT — Métodos Numéricos (versión Fedora revisada)
+# Sistema de Monitoreo de Dispositivos IoT Aplicando Métodos Numéricos
 
-Proyecto en Python con dos modos separados. **No se fabrican lecturas Wi-Fi, fotografías ni ubicaciones.** El modo diagnóstico permite probar Fedora antes de disponer de anclas verificadas. La localización solo se habilita con medidas en dBm y coordenadas de anclas aportadas explícitamente.
+**ESPOCH · Ingeniería Telemática · Investigación Formativa, Fase 1 · Grupo 1**
 
-## Preparación (Fedora 43)
+Código fuente del prototipo de adquisición Wi-Fi/ESP32, métodos numéricos y verificación de movimiento con webcam. Funciona desde la terminal en Windows y Fedora; en el navegador local se muestran las mediciones y las gráficas generadas durante cada ejecución.
 
-Desde la carpeta principal del proyecto:
+## 1. Estructura del repositorio
+
+```text
+Seguridad-IoT_Metodos_Numericos/
+├── main.py                        # Orquestación, cámara continua y panel HTML
+├── src/
+│   ├── __init__.py
+│   ├── metodos_numericos/
+│   │   ├── __init__.py
+│   │   ├── raices.py              # Unidad 1: errores; Unidad 2: Bisección, Secante, Newton
+│   │   └── sistemas_lineales.py   # Unidad 3: Gauss-Seidel, Jacobi, pivoteo, condicionamiento
+│   └── telematica/
+│       ├── __init__.py
+│       └── posicionamiento.py     # Wi-Fi, ESP32, modelo RSSI y trilateración
+├── esp32/ESP32_Ancla_IoT/
+│   ├── ESP32_Ancla_IoT.ino
+│   └── configuracion_local.example.h
+├── tests/                         # Verificación de algoritmos y lectura SNIFF
+├── requirements.txt
+├── .gitignore
+└── README.md
+```
+
+La carpeta `resultados/` se crea al ejecutar; no se publica en GitHub. Los datos experimentales históricos, credenciales, listas de redes y las configuraciones físicas de cada laboratorio se proporcionan aparte de este repositorio.
+
+## 2. Requisitos
+
+- Python 3 compatible con las versiones de `requirements.txt`, cámara USB/integrada y, para el enlace serie, placa ESP32 conectada por USB.
+- Fedora/Linux: herramientas `NetworkManager` (`nmcli`), `iw` e `ip`, disponibles según permisos y modelo de tarjeta.
+- Windows: comandos integrados `netsh` y `arp`. La localización con RSSI a partir de lecturas previas se realiza mediante CSV.
+- Arduino IDE con soporte **ESP32 by Espressif Systems** para cargar el sketch; USB y controlador adecuados a la placa.
+
+### Fedora
 
 ```bash
-sudo dnf install v4l-utils iw NetworkManager
-python3 -m venv .venv                   # solo si aún no existe
+cd ~/Seguridad-IoT_Metodos_Numericos
+python3 -m venv .venv        # solo la primera vez
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-v4l2-ctl --list-devices
-ls -l /dev/video*
-iw dev                                  # identifica la interfaz Wi-Fi
-```
-
-Si ya tienes `.venv`, **no hace falta recrearlo**. Si `python3` no es el de tu entorno, utiliza `python` después de activar `.venv`. No ejecutes los scripts con `sudo` como primera opción. Fedora debe poder acceder al hardware desde tu sesión de usuario. Revisa los permisos de cámara y la aplicación que pudiera estar ocupándola.
-
-## A. Prueba aislada de cámara: primer objetivo
-
-El error `can't open file ... diagnostico_camara_fedora.py` indica que ese archivo no está en el directorio desde el que lo ejecutaste. Ahora se incluye en este paquete.
-
-```bash
-python diagnostico_camara_fedora.py --listar
-python diagnostico_camara_fedora.py --indice 0 --mostrar --segundos 10
-```
-
-La prueba guarda un **fotograma real** en `evidencia_camara_fedora.png` y muestra contadores de fotogramas. Si `/dev/video0` no entrega video, prueba `--indice 1`. `/dev/video1` puede ser un dispositivo de metadatos y no necesariamente un segundo sensor. Si el vídeo se lee pero falla la ventana, vuelve a ejecutarlo sin `--mostrar` para aislar el problema de la interfaz gráfica.
-
-## B. Diagnóstico completo con Wi-Fi y cámara, sin mediciones inventadas
-
-```bash
-python main.py --modo diagnostico --indice-camara 0 --camara-frames 180 \
-    --camara-segundos 20 --salida resultados
-```
-
-Si no existe una sesión gráfica disponible:
-
-```bash
-python main.py --modo diagnostico --sin-ventana --salida resultados
-```
-
-Produce `resultados/resultados.json`, `resultados/reporte_ejecucion.txt` y, si captura video, `resultados/captura_camara_real.png`.
-
-**Nota:** `nmcli` entrega `SIGNAL (%)`, no necesariamente RSSI en dBm. El programa no falsifica dBm con una regla lineal. En este modo no hace trilateración ni genera gráficas de posición.
-
-## C. Localización real: preparación necesaria
-
-Para utilizar el método numérico del anteproyecto necesitas **un único receptor** (por ejemplo, la laptop) que mida las señales RSSI de **los mismos puntos de acceso fijos** en ubicaciones conocidas. No basta con detectar tres o cuatro redes cualesquiera y asociarlas arbitrariamente a las esquinas.
-
-1. Crea `anclas.json`, sustituyendo los valores de ejemplo siguientes por las **BSSID reales** y las posiciones **medidas físicamente** (en metros) de *tus* puntos de acceso:
-
-```json
-[
-  {"id": "AP_A", "bssid": "AA:AA:AA:AA:AA:01", "x_m": 0.0, "y_m": 0.0},
-  {"id": "AP_B", "bssid": "AA:AA:AA:AA:AA:02", "x_m": 6.0, "y_m": 0.0},
-  {"id": "AP_C", "bssid": "AA:AA:AA:AA:AA:03", "x_m": 0.0, "y_m": 6.0},
-  {"id": "AP_D", "bssid": "AA:AA:AA:AA:AA:04", "x_m": 6.0, "y_m": 6.0}
-]
-```
-
-**Estos BSSID y coordenadas son solamente una plantilla de formato, NO son observaciones de tu equipo y NO deben emplearse como evidencia.** Las posiciones no se leen de Wi-Fi; las debe medir la persona que instala las anclas.
-
-2. Identifica la interfaz Wi-Fi con `iw dev` (por ejemplo, `wlp0s20f3`). La utilidad `iw` puede ofrecer los niveles `signal: -xx dBm` por cada BSSID. Algunas tarjetas, configuraciones o permisos no permiten escanear; si `iw dev INTERFAZ scan` falla, el error quedará visible.
-
-3. Usa el `id` de una ancla calibrada a una distancia **medida** `--d-ref`, y proporciona los parámetros reales o experimentales `--pt-dbm`, `--pl-d0` y `--alpha`. También define un intervalo físico de búsqueda `--bis-a` y `--bis-b` donde esperas que estén las distancias.
-
-```bash
-python main.py --modo localizacion --anclas anclas.json --fuente iw \
-    --interfaz NOMBRE_INTERFAZ --barridos 4 \
-    --ancla-calibracion AP_A --d-ref DISTANCIA_MEDIDA \
-    --pt-dbm POTENCIA_TX --pl-d0 PERDIDA_D0 --alpha ABSORCION \
-    --bis-a LIMITE_INFERIOR --bis-b LIMITE_SUPERIOR \
-    --indice-camara 0 --salida resultados
-```
-
-Los textos en mayúsculas se deben sustituir por números o nombres reales; no es un comando listo para ejecutar sin calibrar el experimento.
-
-Si ya tienes un archivo con mediciones reales de RSSI dBm de las anclas, úsalo sin `iw`:
-
-```bash
-python main.py --modo localizacion --anclas anclas.json --fuente json \
-    --lecturas lecturas.json --ancla-calibracion AP_A \
-    --d-ref DISTANCIA_MEDIDA --pt-dbm POTENCIA_TX \
-    --pl-d0 PERDIDA_D0 --alpha ABSORCION \
-    --bis-a LIMITE_INFERIOR --bis-b LIMITE_SUPERIOR --salida resultados
-```
-
-La estructura de `lecturas.json` es:
-
-```json
-[
-  {"bssid": "AA:AA:AA:AA:AA:01", "rssi_dbm": -55.0, "sigma_rssi_db": 1.4},
-  {"bssid": "AA:AA:AA:AA:AA:02", "rssi_dbm": -62.0, "sigma_rssi_db": 1.1},
-  {"bssid": "AA:AA:AA:AA:AA:03", "rssi_dbm": -58.0, "sigma_rssi_db": 1.7},
-  {"bssid": "AA:AA:AA:AA:AA:04", "rssi_dbm": -60.0, "sigma_rssi_db": 1.5}
-]
-```
-
-**Ejemplo de formato únicamente: valores ficticios. No deben utilizarse para evidencias ni para afirmaciones de una práctica real.** Introduce solo tus mediciones. Si no hay muestras repetidas para estimar `sigma_rssi_db`, omite ese campo; el cálculo de incertidumbre quedará como no disponible.
-
-## Calibración de cámara y limitaciones
-
-La posición `pixel_detectado` solo es un punto en la imagen. El programa no convierte automáticamente la esquina de una imagen en metros del cuarto. Para obtener posiciones métricas, prepara un archivo `camara_calibracion.json` con al menos cuatro correspondencias `pixel` a `metros` sobre **un mismo plano físico**:
-
-```json
-{
-  "correspondencias": [
-    {"pixel": [U1, V1], "metros": [X1, Y1]},
-    {"pixel": [U2, V2], "metros": [X2, Y2]},
-    {"pixel": [U3, V3], "metros": [X3, Y3]},
-    {"pixel": [U4, V4], "metros": [X4, Y4]}
-  ]
-}
-```
-
-Sustituye las letras por mediciones propias. Activa con `--calibracion-camara camara_calibracion.json`. Si no existe una detección o una calibración, el programa devuelve `null` para las coordenadas métricas. **Una detección de movimiento no identifica a una persona específica y no confirma que esa persona sea el dispositivo medido por Wi-Fi.** Una cámara inclinada de laptop no ofrece por sí sola una homografía válida para personas a diferentes alturas y profundidades.
-
-## Archivos de evidencia
-
-- `resultados/reporte_ejecucion.txt`: registro de estados y errores.
-- `resultados/resultados.json`: salida completa, medidas de entrada, trazabilidad y flags de error.
-- `resultados/lecturas_adquiridas.json`: RSSI adquiridos para las anclas, si se llegó a medir.
-- `resultados/captura_camara_real.png`: imagen real de webcam, si fue posible leer frames.
-- `resultados/grafica_1_convergencia_no_lineal.png`: métodos de raíces (solo localización).
-- `resultados/grafica_2_convergencia_sistemas_lineales.png`: Gauss-Seidel / Jacobi (solo localización).
-- `resultados/grafica_3_mapa_trilateracion_iot.png`: mapa de anclas registradas (solo localización).
-
-Si la cámara falla, el cálculo o el inventario Wi-Fi puede continuar y se conserva el registro. Las salidas fallidas no se etiquetan como resultados exitosos.
-
-## Pruebas matemáticas independientes
-
-```bash
 python -m unittest discover -s tests -v
 ```
 
-Estas pruebas de control utilizan datos matemáticos *de prueba*, no evidencias de radiofrecuencia. No se requiere webcam ni red para realizarlas.
+### Windows (PowerShell)
 
-## Lo que sigue pendiente científicamente
+```powershell
+cd Seguridad-IoT_Metodos_Numericos
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
 
-- El archivo `wifi_csi_sniffer.py` captura inventario de redes y RSSI mediante `iw`. **No realiza CSI**, aunque el nombre del módulo se mantuvo por compatibilidad con el repositorio anterior.
-- El error respecto a SciPy valida algoritmos numéricos pero no es error de posicionamiento absoluto contra un sistema de verdad terreno.
-- La trilateración estima la posición del **receptor Wi-Fi** frente a anclas fijas, no la posición de una persona observada por la cámara a menos que se diseñe expresamente un experimento con un objetivo común y se valide la geometría.
-- El prototipo necesita verificación de mediciones de energía/potencia, fuentes RSSI y parámetros del canal para convertirse en una prueba física reproducible.
+Si la sesión de Fedora ya contiene `.venv`, actívalo: no necesitas crear otro. Para ver los puertos: `python -m serial.tools.list_ports -v`. Para conocer la interfaz inalámbrica: `iw dev`.
 
-## ESP32: firmware de captura RSSI del Grupo 1
+## 3. ESP32: cargar el firmware del proyecto
 
-El sketch del equipo está publicado en [esp32/ESP32_Ancla_IoT/ESP32_Ancla_IoT.ino](esp32/ESP32_Ancla_IoT/ESP32_Ancla_IoT.ino). Configura un punto de acceso local y recibe tramas Wi-Fi mediante la función `esp_wifi_set_promiscuous_rx_cb`. Su salida serial utiliza el formato `SNIFF,MAC,RSSI` a 115200 baudios, compatible con el protocolo de adquisición del proyecto. El receptor escucha su canal operativo, por lo que el canal debe elegirse según el montaje experimental.
+1. Abre `esp32/ESP32_Ancla_IoT/ESP32_Ancla_IoT.ino` en Arduino IDE.
+2. Copia `esp32/ESP32_Ancla_IoT/configuracion_local.example.h` a `esp32/ESP32_Ancla_IoT/configuracion_local.h` y configura **tu propia** red (SSID), contraseña local de al menos 8 caracteres y canal de trabajo. Este archivo queda excluido mediante `.gitignore`.
+3. Selecciona el modelo de placa y el puerto serie; compila y sube el sketch.
+4. Comprueba en Monitor Serie, **115200 baudios**, la línea `ESP32_LISTO,CANAL,N`. Cuando haya tráfico compatible en ese canal, se emitirán tramas `SNIFF,MAC,RSSI`, una por línea.
+5. **Cierra el Monitor Serie** antes de abrir el puerto con Python. Para Fedora usa el puerto identificado por el sistema, no asumas que siempre será `/dev/ttyUSB0`.
 
-1. Instala Arduino IDE y el soporte de placas ESP32 by Espressif Systems. Selecciona el modelo y puerto USB correctos.
-2. Copia [configuracion_local.example.h](esp32/ESP32_Ancla_IoT/configuracion_local.example.h) como `esp32/ESP32_Ancla_IoT/configuracion_local.h`. Establece `AP_SSID`, `AP_PASSWORD` (8–63 caracteres) y `AP_CHANNEL` conforme a tu práctica. **No publiques el archivo local de credenciales:** está incluido en `.gitignore`.
-3. Abre y carga `ESP32_Ancla_IoT.ino`. En el monitor serial a 115200 baudios, verifica el mensaje de inicio `ESP32_LISTO,CANAL,N` y las líneas `SNIFF,AA:BB:CC:DD:EE:FF,-65` cuando existan paquetes observables.
-4. Cierra el monitor serial antes de ejecutar Python; identifica el puerto con `python -m serial.tools.list_ports -v`. En Fedora suele ser `/dev/ttyUSB0` o `/dev/ttyACM0`; en Windows, `COM3`, `COM4`, etc.
+El ESP32 escucha el canal configurado. Las MAC observadas son campos de tramas inalámbricas que pueden estar aleatorizados; el usuario debe identificar qué transmisor corresponde al objetivo de su ensayo. El firmware registra RSSI por trama, sin alterar su formato original.
 
-El firmware proporciona potencia RSSI por trama y dirección de origen observada. El cálculo de coordenadas métricas requiere además una configuración de anclas no colineales, posiciones físicas y datos de calibración para el mismo objetivo. El protocolo del ESP32 y el modelo de trilateración son etapas complementarias del prototipo.
+## 4. Ejecución normal: monitoreo continuo
+
+Después de activar `.venv`:
+
+```bash
+python main.py --interfaz wlp0s20f3 --puerto-esp32 PUERTO_REAL --indice-camara 0
+```
+
+En Windows omite `--interfaz` o indícala según el equipo y sustituye `PUERTO_REAL` por el `COM` correcto. El puerto y la interfaz no están fijados dentro del código.
+
+El programa realiza inventario Wi-Fi, consulta vecinos LAN, adquiere señales del ESP32 si está disponible y muestra la **webcam en un panel HTML servido en `127.0.0.1`**. La detección óptica calcula actividad y centroide en **píxeles**. Continúa hasta `Ctrl+C`; de manera predeterminada guarda solo fotogramas periódicos y CSV, no un video ilimitado.
+
+Para guardar video de una sesión consentida: `--grabar-video`. Para limitar duración: `--duracion-vivo SEGUNDOS`. Para usar webcam de forma temporal: `--camara-temporal`. Para omitir hardware: `--sin-camara --sin-esp32 --sin-abrir-panel`.
+
+**Cada ejecución crea una subcarpeta `resultados/ensayo_FECHA_UTC/`.** El programa imprime la ruta del HTML y guarda automáticamente las evidencias sin sobrescribir ensayos anteriores.
+
+## 5. Parámetros necesarios para obtener coordenadas
+
+La trilateración es configurable desde la línea de comandos. El operador debe proporcionar, para **tres o más anclas no colineales**, los identificadores BSSID y sus posiciones métricas medidas en el recinto, RSSI en dBm del mismo receptor y los parámetros de propagación correspondientes.
+
+| Parámetro | Debe ingresar el operador |
+|---|---|
+| `--ancla ID,BSSID,X,Y` | Repetir por cada AP de posición conocida; X e Y en metros |
+| `--ancla-calibracion` | ID del AP utilizado para calibrar el exponente de pérdida |
+| `--d-ref` | Distancia física medida desde el receptor al AP de calibración (m) |
+| `--pt-dbm` | Potencia de transmisión de las anclas documentada (dBm) |
+| `--pl-d0`, `--d0` | Pérdida de referencia (dB) y distancia de referencia base (m) |
+| `--alpha` | Atenuación específica del modelo para el recinto (dB/m) |
+| `--bis-a`, `--bis-b` | Límites positivos de búsqueda de distancias (m) |
+| `--lecturas` | CSV con RSSI medido previamente; en Fedora puede omitirse para usar `iw` |
+| `--tol`, `--max-iter` | Tolerancia numérica y máximo de iteraciones |
+
+```bash
+python main.py \
+  --sin-camara --sin-esp32 \
+  --ancla 'A1,BSSID_1,X_1,Y_1' \
+  --ancla 'A2,BSSID_2,X_2,Y_2' \
+  --ancla 'A3,BSSID_3,X_3,Y_3' \
+  --lecturas RUTA/lecturas.csv \
+  --ancla-calibracion A1 --d-ref DISTANCIA_METROS \
+  --pt-dbm POTENCIA_AP --pl-d0 PERDIDA_D0 --alpha ATENUACION \
+  --bis-a DISTANCIA_MIN --bis-b DISTANCIA_MAX
+```
+
+Este bloque describe la **sintaxis de los campos**; reemplaza todos los marcadores antes de ejecutarlo. El CSV contiene cabeceras `bssid,rssi_dbm,sigma_db` (`sigma_db` es opcional). El motor usa Secante para calibración y distancias, Bisección y Newton-Raphson para comparación, y Gauss-Seidel para la solución 2D; Jacobi y eliminación con pivoteo sirven de referencia cruzada. SciPy se utiliza únicamente para contraste de resultados, no para sustituir los métodos implementados.
+
+Si no se proporcionan anclas, el inventario y la cámara siguen disponibles y la localización se marca como **no configurada**. La posición estimada corresponde al receptor Wi-Fi que realizó las mediciones: la comparación con coordenadas de cámara requiere calibración geométrica independiente del mismo escenario.
+
+## 6. Datos anteriores y nuevos ensayos
+
+La aplicación no trae mediciones históricas incorporadas ni genera coordenadas prefijadas al iniciarse. Para consultar un registro anterior del grupo en el panel, se puede proporcionar explícitamente un JSON del formato documentado en el anteproyecto:
+
+```bash
+python main.py --datos-referencia RUTA/registro_ensayo.json --sin-camara --sin-esp32
+```
+
+Ese archivo **no es parte del código fuente**. Los archivos del ensayo se conservan en el informe del equipo o en almacenamiento privado y nunca se mezclan con la adquisición actual. Para una nueva sesión, actualiza el archivo de mediciones correspondiente y ejecuta los mismos algoritmos.
+
+## 7. Resultados y pruebas
+
+Los productos generados dependen del hardware y de las entradas presentes: `resultados.json`, `resultados_informe.txt`, `panel_resultados.html`, capturas de webcam, `camara_mediciones.csv`, gráfico de RSSI del ESP32 y, cuando exista una configuración de anclas completa, tabla de iteraciones y tres gráficas de convergencia/trilateración.
+
+Ejecuta la batería matemática y de parsers antes de publicar cambios:
+
+```bash
+python -m unittest discover -s tests -v
+python main.py --sin-camara --sin-esp32 --sin-abrir-panel
+```
+
+Las pruebas numéricas en `tests/` emplean problemas de solución conocida para detectar regresiones del software; no se incorporan como datos de una ejecución experimental. El archivo `.gitignore` excluye entornos virtuales, mediciones locales, imágenes/grabaciones y credenciales.
+
+## 8. Documentación
+
+El anteproyecto desarrolla el modelo de pérdida log-distancia con absorción, las ecuaciones de Secante, Gauss-Seidel, la propagación del error, la evaluación de convergencia y el cronograma de la Fase 2. El firmware ESP32 y este repositorio constituyen el prototipo de la Fase 1. Todo procesamiento sobre equipos y señales ajenos debe limitarse a entornos autorizados.

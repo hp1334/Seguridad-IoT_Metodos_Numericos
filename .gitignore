@@ -1,31 +1,33 @@
-# Python
 .venv/
 venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-
-# Datos personales y configuraciones
+.vscode/
 .env
 .env.*
-.vscode/
+resultados/
+resultados_*/
+*.respaldo
+src.respaldo/
+*.mp4
+*.avi
+captura_camara_real.png
+camara_mediciones.csv
+
+# Configuración particular del punto de acceso ESP32
+esp32/**/configuracion_local.h
+
+# Lecturas y calibraciones de nuevas pruebas
 anclas.json
 lecturas.json
+configuracion_local.json
 camara_calibracion.json
+*.csv
 
-# Evidencias locales
-resultados/
-resultados_localizacion/
+# Registros previos y pruebas privadas
+/datos_windows_anteproyecto.json
+/registro_ensayo.json
+/evidencia_camara_fedora.png
+/diagnostico_camara_fedora.py.respaldo
 *.log
-captura_camara_real.png
-evidencia_camara_fedora.png
-grafica_*.png
-resultados_informe.txt
-
-# Respaldos
-*.respaldo
-*.respaldo/
-src.respaldo/
-
-# Credenciales y configuración local del ESP32
-esp32/**/configuracion_local.h

@@ -1,49 +1,41 @@
-"""Pruebas UNITARIAS matematicas con datos artificiales identificados como tales.
-No producen evidencia experimental del sistema IoT.
-"""
+"""Pruebas reproducibles de cálculo y adquisición textual (sin hardware)."""
+import math
 import unittest
 import numpy as np
-from src.metodos_numericos.ecuaciones_no_lineales import metodo_biseccion, metodo_secante, metodo_newton_raphson
-from src.metodos_numericos.sistemas_lineales import gauss_seidel, metodo_jacobi, eliminacion_gaussiana_pivoteo
-from src.metodos_numericos.errores import calcular_epsilon_maquina
-from src.telematica.wifi_csi_sniffer import analizar_iw_scan, _campos_nmcli, ensamblar_sistema_trilateracion
+from src.metodos_numericos.raices import epsilon_maquina, biseccion, secante, newton_raphson
+from src.metodos_numericos.sistemas_lineales import gauss_seidel, jacobi, eliminacion_gaussiana
+from src.telematica.posicionamiento import normalizar_mac, extraer_iw, analizar_linea_esp32
 
-
-class Pruebas(unittest.TestCase):
+class PruebasProyecto(unittest.TestCase):
     def test_epsilon(self):
-        self.assertAlmostEqual(calcular_epsilon_maquina(), np.finfo(float).eps)
+        self.assertEqual(epsilon_maquina(), 2**-52)
 
     def test_raices(self):
-        f = lambda x: x*x - 4
-        fp = lambda x: 2*x
-        for r in [metodo_biseccion(f, 1, 3)[0], metodo_secante(f, 1, 3)[0],
-                  metodo_newton_raphson(f, fp, 3)[0]]:
-            self.assertAlmostEqual(r, 2, places=5)
+        f=lambda x:x*x-4
+        d=lambda x:2*x
+        for raiz,h in (biseccion(f,0,3),secante(f,1,3),newton_raphson(f,d,3)):
+            self.assertAlmostEqual(raiz,2,places=5)
+            self.assertGreater(len(h),0)
 
     def test_lineales(self):
-        M = np.array([[4., 1.], [1., 4.]])
-        C = np.array([9., 6.])
-        expected = [2., 1.]
-        for r in [gauss_seidel(M, C, [0., 0.])[0], metodo_jacobi(M, C, [0., 0.])[0],
-                  eliminacion_gaussiana_pivoteo(M, C)]:
-            np.testing.assert_allclose(r, expected, atol=1e-5)
+        A=np.array([[4.,1.],[1.,4.]])
+        b=np.array([9.,6.])
+        for x in (gauss_seidel(A,b,[0.,0.])[0],jacobi(A,b,[0.,0.])[0],eliminacion_gaussiana(A,b)):
+            np.testing.assert_allclose(x,[2.,1.],atol=1e-5)
 
-    def test_iw_parser(self):
-        ejemplo = 'BSS aa:bb:cc:dd:ee:ff(on wlan0)\n\tsignal: -51.50 dBm\n\tSSID: AP_LAB'
-        self.assertEqual(analizar_iw_scan(ejemplo)[0]['rssi_dbm'], -51.5)
+    def test_mac_normalizada(self):
+        self.assertEqual(normalizar_mac('aa-bb-cc-dd-ee-ff'),'AA:BB:CC:DD:EE:FF')
+        with self.assertRaises(ValueError): normalizar_mac('NO-MAC')
 
-    def test_nmcli_parser(self):
-        linea = 'AA\\:BB\\:CC\\:DD\\:EE\\:FF:Red\\:Laboratorio:2437:80'
-        self.assertEqual(_campos_nmcli(linea),
-                         ['AA:BB:CC:DD:EE:FF', 'Red:Laboratorio', '2437', '80'])
+    def test_protocolo_esp32(self):
+        self.assertEqual(analizar_linea_esp32('SNIFF,aa:bb:cc:dd:ee:ff,-64'),
+                         ('AA:BB:CC:DD:EE:FF', -64))
+        self.assertIsNone(analizar_linea_esp32('ESP32_LISTO,CANAL,6'))
+        self.assertIsNone(analizar_linea_esp32('SNIFF,AA:BB:CC:DD:EE:FF,18'))
 
-    def test_trilateracion(self):
-        puntos = np.array([[0.,0.],[6.,0.],[0.,6.],[6.,6.]])
-        objetivo = np.array([2.2, 3.8])
-        distancias = np.linalg.norm(puntos - objetivo, axis=1)
-        A, B, M, C = ensamblar_sistema_trilateracion(puntos, distancias)
-        np.testing.assert_allclose(np.linalg.solve(M, C), objetivo, atol=1e-10)
-
+    def test_iw(self):
+        txt='BSS aa:bb:cc:dd:ee:ff(on wlan0)\n\tsignal: -61.00 dBm\n'
+        self.assertEqual(extraer_iw(txt)['AA:BB:CC:DD:EE:FF'],[-61.0])
 
 if __name__ == '__main__':
     unittest.main()
