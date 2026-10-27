@@ -1,241 +1,233 @@
-# src/telematica/wifi_csi_sniffer.py
+"""Captura real de redes: nmcli para inventario, iw para RSSI directo en dBm.
+
+No asigna APs a esquinas por fuerza de señal ni inventa nodos ESP32.
+No se presenta SIGNAL (%) de nmcli como si fuese RSSI medido (dBm).
 """
-Módulo Telemático Real (Sin datos hardcodeados):
-1. Escanea dispositivos reales en la red local mediante la tabla ARP/vecinos del sistema.
-2. Captura niveles reales de potencia electromagnética (RSSI en dBm), BSSID y frecuencia
-   usando la tarjeta Wi-Fi física de la laptop (nmcli / iwlist / netsh) y/o un ESP32 vía Serial.
-3. Ensambla el sistema linealizado de trilateración M*X = C a partir de mediciones reales.
-"""
+from __future__ import annotations
+
+import json
 import math
-import platform
 import re
 import subprocess
 import time
+from collections import defaultdict
+from pathlib import Path
+
 import numpy as np
 
+MAC = re.compile(r'^[0-9A-F]{2}(?::[0-9A-F]{2}){5}$')
+BSS = re.compile(r'^BSS\s+([0-9a-f:]{17})\b', re.IGNORECASE)
+SIGNAL = re.compile(r'^signal:\s*(-?\d+(?:\.\d+)?)\s*dBm', re.I)
 
-def escanear_dispositivos_red_local():
-    """
-    Consulta la tabla ARP / Neighbor real del sistema operativo para identificar
-    cuántos dispositivos reales (IP y dirección MAC física) están activos en la red.
 
-    Returns:
-        list[dict]: Lista real de dispositivos detectados por la interfaz de red.
-    """
-    dispositivos = []
-    sistema = platform.system().lower()
-
+def _ejecutar(comando, timeout=20):
     try:
-        if "linux" in sistema:
-            salida = subprocess.check_output(["ip", "neigh", "show"], text=True, stderr=subprocess.DEVNULL)
-            for linea in salida.splitlines():
-                partes = linea.split()
-                if "lladdr" in partes:
-                    idx_mac = partes.index("lladdr") + 1
-                    ip = partes[0]
-                    mac = partes[idx_mac].upper()
-                    estado = partes[-1]
-                    dispositivos.append({"ip": ip, "mac": mac, "estado": estado})
+        r = subprocess.run(comando, capture_output=True, text=True, check=True, timeout=timeout)
+        return r.stdout
+    except FileNotFoundError as e:
+        raise RuntimeError(f'Falta el comando del sistema: {comando[0]}') from e
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f'Fallo {" ".join(comando)}: {(e.stderr or e.stdout).strip()}') from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f'El comando {comando[0]} excedio {timeout} segundos.') from e
+
+
+def listar_vecinos_lan():
+    """Lee vecinos ya conocidos; no realiza barridos masivos de IPs."""
+    try:
+        salida = _ejecutar(['ip', 'neigh', 'show'])
+    except RuntimeError as exc:
+        return {'error': str(exc), 'dispositivos': []}
+    resultado = []
+    for linea in salida.splitlines():
+        partes = linea.split()
+        if 'lladdr' in partes:
+            indice = partes.index('lladdr')
+            if indice + 1 < len(partes):
+                resultado.append({'ip': partes[0], 'mac': partes[indice + 1].upper(),
+                                  'estado': partes[-1]})
+    return {'dispositivos': resultado}
+
+
+def _campos_nmcli(linea):
+    """Lee salida terse escapada de nmcli (BSSID y SSID pueden contener ':')."""
+    campos, actual, escapado = [], [], False
+    for caracter in linea:
+        if escapado:
+            actual.append(caracter)
+            escapado = False
+        elif caracter == '\\':
+            escapado = True
+        elif caracter == ':':
+            campos.append(''.join(actual))
+            actual = []
         else:
-            salida = subprocess.check_output(["arp", "-a"], text=True, stderr=subprocess.DEVNULL)
-            patron = re.compile(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:-]{17})\s+(\w+)")
-            for ip, mac, tipo in patron.findall(salida):
-                dispositivos.append({"ip": ip, "mac": mac.upper().replace("-", ":"), "estado": tipo})
-    except Exception as exc:
-        raise RuntimeError(f"Error al consultar la tabla de red del sistema operativo: {exc}") from exc
-
-    return dispositivos
+            actual.append(caracter)
+    if escapado:
+        actual.append('\\')
+    campos.append(''.join(actual))
+    return campos
 
 
-def _capturar_barrido_wifi_os():
-    """
-    Ejecuta una lectura física de la tarjeta Wi-Fi de la laptop y convierte la señal
-    medida a dBm reales. Soporta NetworkManager (nmcli) en Linux y netsh en Windows.
-    """
-    sistema = platform.system().lower()
-    redes_detectadas = []
-
-    if "linux" in sistema:
-        cmd = ["nmcli", "-t", "-f", "BSSID,SSID,FREQ,SIGNAL", "dev", "wifi", "list", "--rescan", "auto"]
-        salida = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
-
-        for linea in salida.splitlines():
-            if not linea.strip():
-                continue
-            # nmcli escapa los ':' del BSSID como '\:'
-            linea_limpia = linea.replace("\\:", "-")
-            partes = linea_limpia.split(":")
-            if len(partes) >= 4:
-                bssid = partes[0].replace("-", ":").upper()
-                ssid = partes[1] if partes[1] else "RED_OCULTA"
-                freq_str = partes[2].replace("MHz", "").strip()
-                sig_pct = float(partes[3])
-
-                # Conversión estándar IEEE 802.11 de porcentaje de calidad a dBm reales
-                rssi_dbm = (sig_pct / 2.0) - 100.0
-                frecuencia_mhz = float(freq_str) if freq_str.isdigit() else 2412.0
-
-                redes_detectadas.append({
-                    "bssid": bssid,
-                    "ssid": ssid,
-                    "frecuencia_mhz": frecuencia_mhz,
-                    "rssi_dbm": rssi_dbm
-                })
-    else:
-        cmd = ["netsh", "wlan", "show", "networks", "mode=bssid"]
-        salida = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, encoding="latin-1")
-        ssid_actual = "DESCONOCIDO"
-        bssid_actual = None
-        for linea in salida.splitlines():
-            linea = linea.strip()
-            if linea.startswith("SSID"):
-                partes = linea.split(":", 1)
-                if len(partes) > 1:
-                    ssid_actual = partes[1].strip() or "RED_OCULTA"
-            elif linea.startswith("BSSID"):
-                partes = linea.split(":", 1)
-                if len(partes) > 1:
-                    bssid_actual = partes[1].strip().upper()
-            elif "%" in linea and bssid_actual:
-                match_pct = re.search(r"(\d+)%", linea)
-                if match_pct:
-                    sig_pct = float(match_pct.group(1))
-                    rssi_dbm = (sig_pct / 2.0) - 100.0
-                    redes_detectadas.append({
-                        "bssid": bssid_actual,
-                        "ssid": ssid_actual,
-                        "frecuencia_mhz": 2412.0,
-                        "rssi_dbm": rssi_dbm
-                    })
-                    bssid_actual = None
-
-    return redes_detectadas
+def inventario_nmcli():
+    """Devuelve SSID, BSSID y porcentaje reportado por NetworkManager."""
+    salida = _ejecutar(['nmcli', '-t', '-e', 'yes', '-f', 'BSSID,SSID,FREQ,SIGNAL',
+                        'device', 'wifi', 'list', '--rescan', 'yes'])
+    redes = []
+    for linea in salida.splitlines():
+        partes = _campos_nmcli(linea)
+        if len(partes) != 4:
+            continue
+        mac, ssid, freq, pct = partes
+        mac = mac.upper()
+        if not MAC.fullmatch(mac):
+            continue
+        try:
+            redes.append({'bssid': mac, 'ssid': ssid, 'frecuencia_mhz': int(freq),
+                          'signal_pct_nmcli': int(pct)})
+        except ValueError:
+            continue
+    return redes
 
 
-def capturar_espectro_wifi_real( coordenada_anclas, num_barridos=3, pausa_seg=0.4):
-    """
-    Realiza múltiples barridos reales con la tarjeta Wi-Fi de la laptop para capturar
-    la potencia RSSI (dBm) y su varianza real respecto a las estaciones/anclas activas.
+def analizar_iw_scan(salida):
+    """Extrae RSSI observado por iw (dBm) del propio receptor, sin conversion %->dBm."""
+    redes = []
+    actual = None
+    for linea in salida.splitlines():
+        s = linea.strip()
+        cabecera = BSS.match(s)
+        if cabecera:
+            if actual is not None and actual.get('rssi_dbm') is not None:
+                redes.append(actual)
+            actual = {'bssid': cabecera.group(1).upper(), 'ssid': '', 'rssi_dbm': None}
+            continue
+        if actual is None:
+            continue
+        m = SIGNAL.match(s)
+        if m:
+            actual['rssi_dbm'] = float(m.group(1))
+        elif s.startswith('SSID:'):
+            actual['ssid'] = s.split(':', 1)[1].strip()
+    if actual is not None and actual.get('rssi_dbm') is not None:
+        redes.append(actual)
+    return redes
 
-    Args:
-        coordenada_anclas (np.ndarray): Coordenadas físicas (x, y) en metros de las anclas en el cuarto.
-        num_barridos (int): Cantidad de muestras reales tomadas en el aire.
-        pausa_seg (float): Tiempo entre barridos consecutivos.
 
-    Returns:
-        dict: Dispositivos ARP reales y mediciones reales de las anclas Wi-Fi.
-    """
-    dispositivos_arp = escanear_dispositivos_red_local()
-    historico_bssid = {}
-
-    for _ in range(num_barridos):
-        lecturas = _capturar_barrido_wifi_os()
-        for red in lecturas:
-            bssid = red["bssid"]
-            if bssid not in historico_bssid:
-                historico_bssid[bssid] = {
-                    "ssid": red["ssid"],
-                    "frecuencia_mhz": red["frecuencia_mhz"],
-                    "muestras_rssi": []
-                }
-            historico_bssid[bssid]["muestras_rssi"].append(red["rssi_dbm"])
-        if num_barridos > 1:
+def capturar_iw(interfaz, barridos, pausa_seg):
+    if not interfaz or not re.fullmatch(r'[a-zA-Z0-9_.-]+', interfaz):
+        raise ValueError('Especifique una interfaz Wi-Fi valida con --interfaz.')
+    if barridos < 1 or pausa_seg < 0:
+        raise ValueError('El numero de barridos debe ser positivo y la pausa no negativa.')
+    registros = defaultdict(list)
+    ssids = {}
+    for indice in range(barridos):
+        salida = _ejecutar(['iw', 'dev', interfaz, 'scan'], timeout=40)
+        for red in analizar_iw_scan(salida):
+            registros[red['bssid']].append(red['rssi_dbm'])
+            ssids[red['bssid']] = red['ssid']
+        if indice + 1 < barridos:
             time.sleep(pausa_seg)
-
-    if len(historico_bssid) < 3:
-        raise RuntimeError(
-            f"Se detectaron solo {len(historico_bssid)} señales Wi-Fi reales en el aire. "
-            "Para la trilateración 2D real se requieren mínimo 3 señales activas "
-            "(ej. Router + ESP32 + Hotspot del celular)."
-        )
-
-    # Seleccionar las N señales reales con mayor potencia (las más cercanas al cuarto)
-    n_requeridas = len(coordenada_anclas)
-    bssid_ordenados = sorted(
-        historico_bssid.items(),
-        key=lambda item: float(np.mean(item[1]["muestras_rssi"])),
-        reverse=True
-    )[:n_requeridas]
-
-    lecturas_anclas = []
-    for idx, (bssid, info) in enumerate(bssid_ordenados):
-        muestras = np.array(info["muestras_rssi"], dtype=float)
-        lecturas_anclas.append({
-            "id_ancla": f"ANCLA_{idx+1}_{info['ssid'][:12]}",
-            "bssid": bssid,
-            "ssid": info["ssid"],
-            "frecuencia_mhz": info["frecuencia_mhz"],
-            "coordenadas": (float(coordenada_anclas[idx][0]), float(coordenada_anclas[idx][1])),
-            "rssi_efectivo_dbm": float(np.mean(muestras)),
-            "varianza_real_db": float(np.var(muestras))
-        })
-
-    return {
-        "total_dispositivos_red": len(dispositivos_arp),
-        "dispositivos_red": dispositivos_arp,
-        "total_redes_aire": len(historico_bssid),
-        "lecturas_anclas": lecturas_anclas
-    }
+    return [{'bssid': mac, 'ssid': ssids.get(mac, ''),
+             'rssi_dbm': float(np.mean(muestras)),
+             'sigma_rssi_db': float(np.std(muestras, ddof=1)) if len(muestras) >= 2 else None,
+             'numero_muestras': len(muestras), 'origen': 'iw_scan'}
+            for mac, muestras in sorted(registros.items())]
 
 
-def construir_ecuacion_calibracion_n(rssi_ref_dbm, d_ref_m, pt_dbm=20.0, pl_d0=40.0, alpha=0.25, d0=1.0):
-    """
-    Construye la ecuación no lineal f(n) = 0 para autocalibrar el exponente de pérdida
-    de trayecto (n) del cuarto usando una medición real a distancia conocida d_ref_m.
-    """
-    def f_n(n):
-        return 10.0 * n * math.log10(d_ref_m / d0) + alpha * d_ref_m + (rssi_ref_dbm - pt_dbm + pl_d0)
+def cargar_anclas(ruta):
+    datos = json.loads(Path(ruta).read_text(encoding='utf-8'))
+    if not isinstance(datos, list) or len(datos) < 3:
+        raise ValueError('Las anclas deben ser una lista JSON de al menos tres dispositivos medidos.')
+    ids, macs, coords, salida = set(), set(), [], []
+    for p in datos:
+        nombre = str(p['id'])
+        mac = str(p['bssid']).upper()
+        if not MAC.fullmatch(mac) or mac in macs or nombre in ids:
+            raise ValueError(f'BSSID / ID invalido o repetido: {nombre}, {mac}')
+        x, y = float(p['x_m']), float(p['y_m'])
+        if not all(math.isfinite(c) for c in (x, y)):
+            raise ValueError('Coordenadas no finitas.')
+        ids.add(nombre)
+        macs.add(mac)
+        coords.append((x, y))
+        salida.append({'id_ancla': nombre, 'bssid': mac, 'coordenadas': (x, y)})
+    geom = np.asarray(coords, dtype=float)
+    if np.linalg.matrix_rank(geom[1:] - geom[0]) < 2:
+        raise ValueError('Las posiciones de las anclas son colineales.')
+    return salida
 
-    return f_n
+
+def cargar_lecturas_json(ruta):
+    """Importa mediciones aportadas por la persona usuaria, sin crear lecturas ficticias."""
+    datos = json.loads(Path(ruta).read_text(encoding='utf-8'))
+    if not isinstance(datos, list):
+        raise ValueError('Las lecturas deben ser una lista JSON.')
+    lecturas = []
+    for elemento in datos:
+        mac = str(elemento['bssid']).upper()
+        rssi = float(elemento['rssi_dbm'])
+        if not MAC.fullmatch(mac) or not math.isfinite(rssi):
+            raise ValueError(f'Lectura invalida: {mac}, {rssi}')
+        sigma = elemento.get('sigma_rssi_db')
+        if sigma is not None:
+            sigma = float(sigma)
+            if sigma < 0 or not math.isfinite(sigma):
+                raise ValueError(f'Desviacion RSSI invalida para {mac}')
+        lecturas.append({'bssid': mac, 'rssi_dbm': rssi, 'sigma_rssi_db': sigma,
+                         'numero_muestras': elemento.get('numero_muestras'),
+                         'origen': 'json_proporcionado_por_usuario'})
+    return lecturas
 
 
-def construir_ecuacion_distancia(rssi_medido, pt_dbm=20.0, pl_d0=40.0, n=2.6, alpha=0.25, d0=1.0):
-    """
-    Construye la ecuación transcendental f(d) = 0 y su derivada f'(d) para hallar
-    la distancia física a partir del RSSI real medido en dBm:
-    f(d) = 10 * n * log10(d / d0) + alpha * d + (RSSI - Pt + PL(d0)) = 0
-    """
+def asociar_lecturas_anclas(anclas, mediciones):
+    por_mac = {r['bssid']: r for r in mediciones}
+    faltantes = [a['id_ancla'] + ' (' + a['bssid'] + ')' for a in anclas if a['bssid'] not in por_mac]
+    if faltantes:
+        raise RuntimeError('Faltan mediciones de anclas registradas: ' + ', '.join(faltantes))
+    resultado = []
+    for a in anclas:
+        r = por_mac[a['bssid']]
+        resultado.append({**a, 'rssi_efectivo_dbm': r['rssi_dbm'],
+                          'sigma_rssi_db': r['sigma_rssi_db'],
+                          'numero_muestras': r.get('numero_muestras'), 'origen': r['origen']})
+    return resultado
+
+
+def construir_ecuacion_calibracion_n(rssi_ref_dbm, d_ref_m, pt_dbm, pl_d0, alpha, d0=1.0):
+    if min(d_ref_m, d0) <= 0 or math.isclose(d_ref_m, d0):
+        raise ValueError('Las distancias de calibracion y referencia deben ser positivas y distintas.')
+    def f(n):
+        return 10.0 * n * math.log10(d_ref_m / d0) + alpha * d_ref_m + rssi_ref_dbm - pt_dbm + pl_d0
+    return f
+
+
+def construir_ecuacion_distancia(rssi_medido, pt_dbm, pl_d0, n, alpha, d0=1.0):
+    if n <= 0 or d0 <= 0 or alpha < 0:
+        raise ValueError('n y d0 deben ser positivos; alpha no puede ser negativo.')
     constante = rssi_medido - pt_dbm + pl_d0
-
-    def f_d(d):
+    def f(d):
         if d <= 0:
-            return -1e9
+            raise ValueError('La distancia debe ser positiva.')
         return 10.0 * n * math.log10(d / d0) + alpha * d + constante
-
-    def df_d(d):
+    def df(d):
         if d <= 0:
-            return 1e9
-        return (10.0 * n) / (d * math.log(10.0)) + alpha
-
-    return f_d, df_d
+            raise ValueError('La distancia debe ser positiva.')
+        return 10.0 * n / (d * math.log(10.0)) + alpha
+    return f, df
 
 
 def ensamblar_sistema_trilateracion(nodos_ancla, distancias_estimadas):
-    """
-    Linealiza el sistema de intersección de circunferencias reales restando el nodo pivote N
-    y forma el sistema normalizado M*X = C (donde M = A^T * A y C = A^T * B).
-    """
-    n_total = len(nodos_ancla)
-    if n_total < 3:
-        raise ValueError("Se requieren al menos 3 anclas reales para trilateración 2D.")
-
-    x_piv, y_piv = nodos_ancla[-1]
-    d_piv = distancias_estimadas[-1]
-
-    A_filas = []
-    B_filas = []
-
-    for i in range(n_total - 1):
-        xi, yi = nodos_ancla[i]
-        di = distancias_estimadas[i]
-
-        A_filas.append([2.0 * (xi - x_piv), 2.0 * (yi - y_piv)])
-        b_val = (xi**2 - x_piv**2) + (yi**2 - y_piv**2) - (di**2 - d_piv**2)
-        B_filas.append(b_val)
-
-    A = np.array(A_filas, dtype=float)
-    B = np.array(B_filas, dtype=float)
-
-    M = A.T @ A
-    C = A.T @ B
-    return A, B, M, C
+    nodos = np.asarray(nodos_ancla, dtype=float)
+    distancias = np.asarray(distancias_estimadas, dtype=float)
+    if len(nodos) < 3 or len(nodos) != len(distancias) or nodos.shape[1] != 2:
+        raise ValueError('Nodos/distancias inconsistentes o menos de tres anclas.')
+    if np.any(distancias <= 0):
+        raise ValueError('Distancias no positivas.')
+    piv = nodos[-1]
+    dp = distancias[-1]
+    A = 2.0 * (nodos[:-1] - piv)
+    B = np.sum(nodos[:-1]**2, axis=1) - np.sum(piv**2) - (distancias[:-1]**2 - dp**2)
+    if np.linalg.matrix_rank(A) != 2:
+        raise ValueError('La geometria no permite trilateracion bidimensional.')
+    return A, B, A.T @ A, A.T @ B

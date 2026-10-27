@@ -1,270 +1,340 @@
-# main.py
+"""Orquestador Fedora. No fabrica lecturas, anclas ni evidencias experimentales.
+
+Modos:
+  diagnostico: inventario LAN + Wi-Fi nmcli + webcam fisica.
+  localizacion: anclas verificadas + RSSI dBm (iw o JSON medido) + metodos.
 """
-Script Principal en Vivo - Sistema Híbrido de Seguridad IoT y Métodos Numéricos.
-Ejecuta mediciones reales con la tarjeta Wi-Fi de la laptop y la cámara web física:
-1. Escaneo real de dispositivos en la red (ARP/Vecinos) y barrido de potencia Wi-Fi (dBm).
-2. Autocalibración real del exponente de atenuación (n) con el Método de la Secante (Unidad 2).
-3. Despeje de distancias físicas reales con Bisección, Secante y Newton-Raphson (Unidad 2).
-4. Trilateración espacial 2D con Gauss-Seidel, Jacobi y Eliminación Gaussiana (Unidad 3).
-5. Activación de la cámara web física de la laptop (OpenCV) para capturar el movimiento real.
-"""
-import numpy as np
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+
+import matplotlib
+matplotlib.use('Agg')  # Archivos PNG: compatible incluso si falla GUI de OpenCV.
 import matplotlib.pyplot as plt
-from scipy.optimize import root_scalar
+import numpy as np
 from scipy.linalg import solve
+from scipy.optimize import root_scalar
 
-from src.metodos_numericos.errores import (
-    calcular_epsilon_maquina,
-    calcular_numero_condicion,
-)
+from src.metodos_numericos.errores import (calcular_epsilon_maquina,
+    calcular_numero_condicion, error_absoluto)
 from src.metodos_numericos.ecuaciones_no_lineales import (
-    metodo_biseccion,
-    metodo_secante,
-    metodo_newton_raphson,
-)
+    metodo_biseccion, metodo_secante, metodo_newton_raphson)
 from src.metodos_numericos.sistemas_lineales import (
-    gauss_seidel,
-    metodo_jacobi,
-    eliminacion_gaussiana_pivoteo,
-)
-from src.telematica.wifi_csi_sniffer import (
-    capturar_espectro_wifi_real,
-    construir_ecuacion_calibracion_n,
-    construir_ecuacion_distancia,
-    ensamblar_sistema_trilateracion,
-)
+    gauss_seidel, metodo_jacobi, eliminacion_gaussiana_pivoteo)
 from src.telematica.camara_trigger import ejecutar_verificacion_visual
+from src.telematica.wifi_csi_sniffer import (inventario_nmcli, listar_vecinos_lan,
+    capturar_iw, cargar_anclas, cargar_lecturas_json, asociar_lecturas_anclas,
+    construir_ecuacion_calibracion_n, construir_ecuacion_distancia,
+    ensamblar_sistema_trilateracion)
 
 
-def ejecutar_prueba_control_analitico():
-    """
-    Recomendación Sección 7 del Instructivo:
-    Verifica la exactitud matemática del código propio con un caso de solución conocida.
-    """
-    print("=" * 80)
-    print("0. VERIFICACIÓN MATEMÁTICA DE CONTROL (CASO CON SOLUCIÓN ANALÍTICA CONOCIDA)")
-    print("=" * 80)
+def argumentos():
+    p = argparse.ArgumentParser(description='Monitoreo IoT y metodos numericos en Fedora')
+    p.add_argument('--modo', choices=['diagnostico', 'localizacion'], default='diagnostico')
+    p.add_argument('--salida', default='resultados', help='Carpeta para evidencias reales y reportes')
+    p.add_argument('--indice-camara', type=int, default=0)
+    p.add_argument('--backend-camara', choices=['auto', 'v4l2'], default='v4l2')
+    p.add_argument('--camara-frames', type=int, default=180)
+    p.add_argument('--camara-segundos', type=float, default=20.0)
+    p.add_argument('--camara-umbral', type=int, default=18)
+    p.add_argument('--camara-area-min', type=float, default=400.0)
+    p.add_argument('--camara-calentamiento', type=int, default=8)
+    p.add_argument('--camara-pausa-ms', type=int, default=35)
+    p.add_argument('--sin-ventana', action='store_true', help='Capturar sin cv2.imshow')
+    p.add_argument('--omitir-camara', action='store_true', help='Omitir prueba fisica de camara')
+    p.add_argument('--calibracion-camara', help='JSON con correspondencias pixel / metros')
+    p.add_argument('--anclas', help='JSON de BSSID y coordenadas fisicas verificadas')
+    p.add_argument('--fuente', choices=['iw', 'json'], default='iw')
+    p.add_argument('--interfaz', help='Interfaz Wi-Fi, por ejemplo wlp0s20f3; requerido para iw')
+    p.add_argument('--lecturas', help='JSON de lecturas RSSI reales; requerido con fuente json')
+    p.add_argument('--barridos', type=int, default=3)
+    p.add_argument('--pausa-barridos', type=float, default=0.5)
+    p.add_argument('--ancla-calibracion', help='ID de ancla a distancia fisica conocida')
+    p.add_argument('--d-ref', type=float, help='Distancia REAL en metros desde el receptor al ancla de calibracion')
+    p.add_argument('--pt-dbm', type=float, help='Potencia TX medida/documentada del emisor, dBm')
+    p.add_argument('--pl-d0', type=float, help='Perdida a la distancia base d0 en dB, medida/documentada')
+    p.add_argument('--alpha', type=float, help='Absorcion del medio medida/estimada en dB/m')
+    p.add_argument('--d0', type=float, default=1.0, help='Distancia fisica base d0 del modelo (m)')
+    p.add_argument('--bis-a', type=float, help='Limite inferior del intervalo de distancias (m)')
+    p.add_argument('--bis-b', type=float, help='Limite superior del intervalo de distancias (m)')
+    p.add_argument('--d0-secante', type=float, help='Primera semilla de distancias (m)')
+    p.add_argument('--d1-secante', type=float, help='Segunda semilla de distancias (m)')
+    p.add_argument('--d0-newton', type=float, help='Semilla Newton para distancias (m)')
+    p.add_argument('--n0-secante', type=float, default=1.5)
+    p.add_argument('--n1-secante', type=float, default=4.0)
+    p.add_argument('--semilla-x', type=float)
+    p.add_argument('--semilla-y', type=float)
+    p.add_argument('--tol', type=float, default=1e-6)
+    p.add_argument('--max-iter', type=int, default=100)
+    return p.parse_args()
 
-    eps = calcular_epsilon_maquina()
-    print(f"[Unidad 1] Épsilon de máquina IEEE 754 calculado : {eps:.4e}")
 
-    raiz_sec, _ = metodo_secante(lambda x: x**2 - 4.0, 1.0, 3.0, tol=1e-8, valor_exacto=2.0)
-    print(f"[Unidad 2] Ecuación control x^2 - 4 = 0          : Exacta = 2.0 | Secante = {raiz_sec:.6f}")
-
-    M_ctrl = np.array([[4.0, 1.0], [1.0, 4.0]])
-    C_ctrl = np.array([9.0, 6.0])
-    sol_gs, _, _ = gauss_seidel(M_ctrl, C_ctrl, x0=[0.0, 0.0], tol=1e-8, sol_exacta=np.array([2.0, 1.0]))
-    print(f"[Unidad 3] Sistema control 2x2                   : Exacta = (2.0, 1.0) | Gauss-Seidel = ({sol_gs[0]:.6f}, {sol_gs[1]:.6f})\n")
+def guardar_json(ruta, contenido):
+    ruta = Path(ruta)
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    ruta.write_text(json.dumps(contenido, ensure_ascii=False, indent=2,
+                              allow_nan=False, default=lambda x: float(x) if isinstance(x, np.floating) else str(x)),
+                    encoding='utf-8')
 
 
-def main():
-    ejecutar_prueba_control_analitico()
-
-    # Coordenadas físicas (en metros) donde están ubicados los transmisores/anclas en tu habitación
-    # (Puedes ajustar estos metros según el tamaño real de tu cuarto/laboratorio)
-    dimensiones_cuarto = (6.0, 6.0)
-    coordenadas_anclas_cuarto = np.array([
-        [0.0, 0.0],  # Ancla 1 (Señal más fuerte, ej. ESP32 / Router cercano)
-        [6.0, 0.0],  # Ancla 2 (Esquina derecha)
-        [0.0, 6.0],  # Ancla 3 (Esquina superior izquierda)
-        [6.0, 6.0],  # Ancla 4 (Esquina opuesta - Pivote de linealización)
-    ])
-    distancia_referencia_ancla1_m = 1.80  # Distancia física conocida al transmisor principal para autocalibrar n
-
-    print("=" * 80)
-    print("1. BARRIDO REAL DE DISPOSITIVOS EN RED Y ESPECTRO WI-FI DESDE LA LAPTOP")
-    print("=" * 80)
-    datos_reales = capturar_espectro_wifi_real(coordenadas_anclas_cuarto, num_barridos=3)
-
-    print(f"Total de redes Wi-Fi reales captadas en el aire : {datos_reales['total_redes_aire']}")
-    print(f"Dispositivos activos en la tabla ARP de la red  : {datos_reales['total_dispositivos_red']}")
-    for disp in datos_reales["dispositivos_red"][:8]:
-        print(f"  -> IP: {disp['ip']:<15} | MAC Real: {disp['mac']:<18} | Estado: {disp['estado']}")
-
-    print("\nAnclas Wi-Fi Reales Seleccionadas para la Trilateración:")
-    for ancla in datos_reales["lecturas_anclas"]:
-        print(
-            f"  -> {ancla['id_ancla']:<20} | BSSID: {ancla['bssid']} | "
-            f"Freq: {ancla['frecuencia_mhz']:.0f} MHz | "
-            f"RSSI Real: {ancla['rssi_efectivo_dbm']:6.2f} dBm | "
-            f"Varianza: {ancla['varianza_real_db']:.4f}"
-        )
-
-    # 2. AUTOCALIBRACIÓN REAL DEL EXPONENTE DE TRAYECTORIA (n) CON MÉTODO DE LA SECANTE
-    print("\n" + "=" * 80)
-    print("2. UNIDAD 2 (PARTE A): AUTOCALIBRACIÓN DEL CANAL INALÁMBRICO REAL f(n) = 0")
-    print("=" * 80)
-    rssi_ancla_1 = datos_reales["lecturas_anclas"][0]["rssi_efectivo_dbm"]
-    f_calib_n = construir_ecuacion_calibracion_n(rssi_ancla_1, d_ref_m=distancia_referencia_ancla1_m)
-    n_scipy_ref = root_scalar(f_calib_n, bracket=[0.5, 8.0], method="brentq").root
-    n_calibrado, hist_calib_n = metodo_secante(f_calib_n, 1.5, 4.0, tol=1e-6, valor_exacto=n_scipy_ref)
-
-    print(f"RSSI real medido del Ancla 1 a {distancia_referencia_ancla1_m} m : {rssi_ancla_1:.2f} dBm")
-    print(f"Exponente de atenuación (n) autocalibrado : {n_calibrado:.6f} (Convergió en {len(hist_calib_n)} iteraciones)")
-
-    # 3. DESPEJE DE DISTANCIAS FÍSICAS REALES CON BISECCIÓN, SECANTE Y NEWTON-RAPHSON
-    print("\n" + "=" * 80)
-    print("3. UNIDAD 2 (PARTE B): CÁLCULO DE DISTANCIAS FÍSICAS REALES f(d) = 0")
-    print("=" * 80)
-
-    distancias_reales_estimadas = []
-    hist_biseccion_a1, hist_secante_a1, hist_newton_a1 = [], [], []
-
-    for idx, lectura in enumerate(datos_reales["lecturas_anclas"]):
-        rssi = lectura["rssi_efectivo_dbm"]
-        f_d, df_d = construir_ecuacion_distancia(rssi, n=n_calibrado)
-
-        sol_scipy_d = root_scalar(f_d, bracket=[0.05, 50.0], method="brentq").root
-        d_bis, h_bis = metodo_biseccion(f_d, 0.05, 50.0, tol=1e-6, valor_exacto=sol_scipy_d)
-        d_sec, h_sec = metodo_secante(f_d, 0.5, 8.0, tol=1e-6, valor_exacto=sol_scipy_d)
-        d_nr, h_nr = metodo_newton_raphson(f_d, df_d, x0=3.0, tol=1e-6, valor_exacto=sol_scipy_d)
-
-        distancias_reales_estimadas.append(d_sec)
-
-        if idx == 0:
-            hist_biseccion_a1, hist_secante_a1, hist_newton_a1 = h_bis, h_sec, h_nr
-
-        print(
-            f"{lectura['id_ancla']:<20} | RSSI: {rssi:6.2f} dBm | "
-            f"d_Secante: {d_sec:6.3f}m ({len(h_sec):2d} it) | "
-            f"d_Newton: {d_nr:6.3f}m ({len(h_nr):2d} it) | "
-            f"d_Bisección: {d_bis:6.3f}m ({len(h_bis):2d} it)"
-        )
-
-    print("\n--- Tabla Trazable de Iteraciones Unidad 2 (Método de la Secante - Ancla 1) ---")
-    print(f"{'Iter':<5} | {'d_k (m)':<12} | {'|f(d_k)|':<12} | {'Error Abs (m)':<14} | {'Error Rel (%)':<14} | {'Error Verd. vs SciPy':<18}")
-    print("-" * 86)
-    for it in hist_secante_a1:
-        print(
-            f"{it['iteracion']:<5} | {it['aproximacion']:<12.6f} | {abs(it['f_x']):<12.4e} | "
-            f"{it['error_abs']:<14.4e} | {it['error_rel_pct']:<14.6f} | {it['error_verdadero']:<18.4e}"
-        )
-
-    # 4. TRILATERACIÓN LINEALIZADA CON GAUSS-SEIDEL, JACOBI Y ELIMINACIÓN GAUSSIANA
-    print("\n" + "=" * 80)
-    print("4. UNIDAD 3: LOCALIZACIÓN ESPACIAL 2D (SISTEMA LINEALIZADO M*X = C)")
-    print("=" * 80)
-
-    nodos_usados = np.array([a["coordenadas"] for a in datos_reales["lecturas_anclas"]])
-    A, B, M, C = ensamblar_sistema_trilateracion(nodos_usados, distancias_reales_estimadas)
-    cond_M = calcular_numero_condicion(M)
-    sol_scipy_xy = solve(M, C)
-
-    semilla_xy = np.mean(nodos_usados, axis=0)
-    coord_gs, hist_gs, dom_info = gauss_seidel(M, C, semilla_xy, tol=1e-6, sol_exacta=sol_scipy_xy)
-    coord_jac, hist_jac = metodo_jacobi(M, C, semilla_xy, tol=1e-6, sol_exacta=sol_scipy_xy)
-    coord_gauss_piv = eliminacion_gaussiana_pivoteo(M, C)
-
-    print(f"Diagnóstico de Dominancia Diagonal : {dom_info[1]}")
-    print(f"Número de Condición K_inf(M)       : {cond_M:.4f}")
-    print(f"Solución por Gauss-Seidel ({len(hist_gs):2d} iter): X = {coord_gs[0]:.4f} m, Y = {coord_gs[1]:.4f} m")
-    print(f"Solución por Jacobi       ({len(hist_jac):2d} iter): X = {coord_jac[0]:.4f} m, Y = {coord_jac[1]:.4f} m")
-    print(f"Solución Eliminación Gaussiana     : X = {coord_gauss_piv[0]:.4f} m, Y = {coord_gauss_piv[1]:.4f} m")
-    print(f"Verificación Externa (SciPy solve) : X = {sol_scipy_xy[0]:.4f} m, Y = {sol_scipy_xy[1]:.4f} m")
-
-    print("\n--- Tabla Trazable de Iteraciones Unidad 3 (Método de Gauss-Seidel) ---")
-    print(f"{'Iter':<5} | {'X_k (m)':<10} | {'Y_k (m)':<10} | {'Error Abs (m)':<14} | {'Error Rel (%)':<14} | {'Error Verd. vs SciPy':<18}")
-    print("-" * 82)
-    for it in hist_gs:
-        print(
-            f"{it['iteracion']:<5} | {it['x']:<10.5f} | {it['y']:<10.5f} | "
-            f"{it['error_abs']:<14.4e} | {it['error_rel_pct']:<14.6f} | {it['error_verdadero']:<18.4e}"
-        )
-
-    # 5. TRIGGER DE CÁMARA WEB EN VIVO (OPENCV)
-    print("\n" + "=" * 80)
-    print("5. TRIGGER HÍBRIDO: DETECCIÓN DE MOVIMIENTO EN VIVO CON CÁMARA DE LA LAPTOP")
-    print("=" * 80)
-    reporte_camara = ejecutar_verificacion_visual(coord_gs, dimensiones_cuarto=dimensiones_cuarto)
-    print(f"Resolución de la Cámara Web        : {reporte_camara['resolucion_camara']} ({reporte_camara['frames_analizados']} frames)")
-    print(f"Área de Movimiento Detectada       : {reporte_camara['area_movimiento_px2']} px^2")
-    print(f"Centroide del Movimiento en Cámara : Píxel {reporte_camara['pixel_detectado']}")
-    print(f"Coordenada Física Cámara (X, Y)    : X = {reporte_camara['coordenada_visual_m'][0]:.4f} m, Y = {reporte_camara['coordenada_visual_m'][1]:.4f} m")
-    print(f"Diferencia Wi-Fi vs Cámara         : {reporte_camara['discrepancia_wifi_camara_m']:.4f} m")
-    print(f"Evidencia Fotográfica Guardada en  : {reporte_camara['archivo_evidencia']}")
-    print(f"Estado del Sistema de Seguridad    : [{reporte_camara['estado_alerta']}]")
-
-    generar_graficas_proyecto(
-        hist_biseccion_a1,
-        hist_secante_a1,
-        hist_newton_a1,
-        hist_gs,
-        hist_jac,
-        datos_reales["lecturas_anclas"],
-        distancias_reales_estimadas,
-        coord_gs,
-        reporte_camara["coordenada_visual_m"]
+def config_camara(args, coord_wifi=None):
+    calibracion = None
+    if args.calibracion_camara:
+        archivo = json.loads(Path(args.calibracion_camara).read_text(encoding='utf-8'))
+        calibracion = archivo['correspondencias']
+    return ejecutar_verificacion_visual(
+        coord_wifi=coord_wifi,
+        indice_camara=args.indice_camara,
+        backend=args.backend_camara,
+        num_frames_captura=args.camara_frames,
+        tiempo_max_seg=args.camara_segundos,
+        mostrar_ventana=not args.sin_ventana,
+        ruta_captura=str(Path(args.salida) / 'captura_camara_real.png'),
+        umbral_diferencia=args.camara_umbral,
+        area_minima_px2=args.camara_area_min,
+        calentamiento_frames=args.camara_calentamiento,
+        pausa_ms=args.camara_pausa_ms,
+        correspondencias=calibracion,
     )
 
 
-def generar_graficas_proyecto(h_bis, h_sec, h_nr, h_gs, h_jac, lecturas_anclas, distancias, pos_gs, pos_cam):
-    """Exporta las gráficas del prototipo con las mediciones reales obtenidas."""
-    plt.figure(figsize=(8, 5))
-    plt.plot([i["iteracion"] for i in h_bis], [i["error_abs"] for i in h_bis], "o--", label="Bisección")
-    plt.plot([i["iteracion"] for i in h_sec], [i["error_abs"] for i in h_sec], "s-", label="Secante")
-    plt.plot([i["iteracion"] for i in h_nr], [i["error_abs"] for i in h_nr], "^-", label="Newton-Raphson")
-    plt.yscale("log")
-    plt.title("Convergencia en Estimación de Distancia Wi-Fi Real (Unidad 2)")
-    plt.xlabel("Número de Iteración (k)")
-    plt.ylabel("Error Absoluto Aproximado (m) [Escala Log]")
-    plt.grid(True, which="both", linestyle="--", alpha=0.6)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("grafica_1_convergencia_no_lineal.png", dpi=300)
-    plt.close()
-
-    plt.figure(figsize=(8, 5))
-    plt.plot([i["iteracion"] for i in h_gs], [i["error_rel_pct"] for i in h_gs], "b-o", label="Gauss-Seidel")
-    plt.plot([i["iteracion"] for i in h_jac], [i["error_rel_pct"] for i in h_jac], "r--s", label="Jacobi")
-    plt.yscale("log")
-    plt.title("Convergencia en Trilateración Real: Gauss-Seidel vs. Jacobi (Unidad 3)")
-    plt.xlabel("Número de Iteración (k)")
-    plt.ylabel("Error Relativo Aproximado (%) [Escala Log]")
-    plt.grid(True, which="both", linestyle="--", alpha=0.6)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("grafica_2_convergencia_sistemas_lineales.png", dpi=300)
-    plt.close()
-
-    fig, ax = plt.subplots(figsize=(7, 7))
-    colores = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd"]
-    for idx, lectura in enumerate(lecturas_anclas):
-        ax_x, ax_y = lectura["coordenadas"]
-        color = colores[idx % len(colores)]
-        circulo = plt.Circle(
-            (ax_x, ax_y),
-            distancias[idx],
-            color=color,
-            fill=False,
-            linestyle="--",
-            alpha=0.7,
-            label=f"{lectura['id_ancla']} ({lectura['rssi_efectivo_dbm']:.1f} dBm -> {distancias[idx]:.2f}m)"
-        )
-        ax.add_patch(circulo)
-        ax.plot(ax_x, ax_y, "ks", markersize=9)
-        ax.text(ax_x + 0.15, ax_y + 0.15, lectura["id_ancla"], fontsize=8, fontweight="bold")
-
-    ax.plot(pos_gs[0], pos_gs[1], "ro", markersize=10, label=f"Posición Wi-Fi Gauss-Seidel ({pos_gs[0]:.2f}, {pos_gs[1]:.2f}) m")
-    ax.plot(pos_cam[0], pos_cam[1], "b^", markersize=10, label=f"Detección Cámara Real ({pos_cam[0]:.2f}, {pos_cam[1]:.2f}) m")
-
-    ax.set_xlim(-3, 9)
-    ax.set_ylim(-3, 9)
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_title("Mapa Espacial de Trilateración con Señales Wi-Fi Reales y Cámara")
-    ax.set_xlabel("Coordenada Espacial X (m)")
-    ax.set_ylabel("Coordenada Espacial Y (m)")
-    ax.grid(True, linestyle=":", alpha=0.7)
-    ax.legend(loc="upper right", fontsize=8)
-    plt.tight_layout()
-    plt.savefig("grafica_3_mapa_trilateracion_iot.png", dpi=300)
-    plt.close()
-
-    print("\n[OK] Se generaron exitosamente los archivos reales del proyecto:")
-    print("     1. grafica_1_convergencia_no_lineal.png")
-    print("     2. grafica_2_convergencia_sistemas_lineales.png")
-    print("     3. grafica_3_mapa_trilateracion_iot.png")
-    print("     4. captura_camara_real.png (Fotografía real tomada con tu webcam)")
+def diagnostico(args, log, resultados):
+    log('FASE DIAGNOSTICO (sin fingir trilateracion ni RSSI dBm)')
+    try:
+        vecinos = listar_vecinos_lan()
+        resultados['lan'] = vecinos
+        log(f'Vecinos LAN conocidos: {len(vecinos.get("dispositivos", []))}')
+    except Exception as exc:
+        resultados['error_lan'] = str(exc)
+        log(f'[ERROR LAN] {exc}')
+    try:
+        redes = inventario_nmcli()
+        resultados['redes_nmcli'] = redes
+        log(f'Redes detectadas via nmcli: {len(redes)} (SIGNAL en %, NO RSSI en dBm)')
+        for r in redes:
+            log(f'  {r["bssid"]} | SSID={r["ssid"]} | senal={r["signal_pct_nmcli"]}%')
+    except Exception as exc:
+        resultados['error_wifi'] = str(exc)
+        log(f'[ERROR Wi-Fi] {exc}')
 
 
-if __name__ == "__main__":
-    main()
+def validar_localizacion(args):
+    necesarios = {'--anclas': args.anclas, '--ancla-calibracion': args.ancla_calibracion,
+                  '--d-ref': args.d_ref, '--pt-dbm': args.pt_dbm,
+                  '--pl-d0': args.pl_d0, '--alpha': args.alpha,
+                  '--bis-a': args.bis_a, '--bis-b': args.bis_b}
+    faltantes = [k for k, v in necesarios.items() if v is None]
+    if args.fuente == 'iw' and not args.interfaz:
+        faltantes.append('--interfaz')
+    if args.fuente == 'json' and not args.lecturas:
+        faltantes.append('--lecturas')
+    if faltantes:
+        raise ValueError('En modo localizacion hacen falta: ' + ', '.join(faltantes))
+    if args.tol <= 0 or args.max_iter < 1:
+        raise ValueError('La tolerancia y el numero de iteraciones deben ser positivos.')
+    if args.d0 <= 0 or args.d_ref <= 0 or args.alpha < 0 or args.bis_a <= 0 or args.bis_b <= args.bis_a:
+        raise ValueError('Revise d0, d-ref, alpha e intervalo positivo [bis-a, bis-b].')
+    if args.d0 == args.d_ref:
+        raise ValueError('d-ref debe ser diferente de d0 para calibrar n.')
+
+
+def graficar_convergencia(historiales, titulo, archivo):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for nombre, historia in historiales.items():
+        if not historia:
+            continue
+        iteraciones = [h['iteracion'] for h in historia]
+        errores = [max(float(h['error_abs']), np.finfo(float).eps) for h in historia]
+        ax.semilogy(iteraciones, errores, marker='o', label=nombre)
+    ax.set_title(titulo)
+    ax.set_xlabel('Iteracion')
+    ax.set_ylabel('Error absoluto aproximado')
+    ax.legend()
+    ax.grid(True, which='both', alpha=.3)
+    fig.tight_layout()
+    fig.savefig(archivo, dpi=200)
+    plt.close(fig)
+
+
+def graficar_mapa(anclas, distancias, posicion, salida):
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for a, d in zip(anclas, distancias):
+        x, y = a['coordenadas']
+        ax.plot([x], [y], marker='s', color='black')
+        ax.add_patch(plt.Circle((x, y), d, fill=False, linestyle='--', alpha=.7))
+        ax.annotate(a['id_ancla'], (x, y), xytext=(5, 5), textcoords='offset points')
+    ax.plot([posicion[0]], [posicion[1]], 'ro', label='Posicion estimada por Wi-Fi')
+    ax.set_aspect('equal', adjustable='datalim')
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_title('Trilateracion RSSI: anclas declaradas y mediciones asociadas')
+    ax.legend()
+    ax.grid(True, alpha=.3)
+    fig.tight_layout()
+    fig.savefig(salida, dpi=200)
+    plt.close(fig)
+
+
+def localizacion(args, log, resultados):
+    validar_localizacion(args)
+    anclas = cargar_anclas(args.anclas)
+    log(f'Anclas fisicas declaradas: {len(anclas)}')
+    if args.fuente == 'iw':
+        medidas = capturar_iw(args.interfaz, args.barridos, args.pausa_barridos)
+    else:
+        medidas = cargar_lecturas_json(args.lecturas)
+    guardar_json(Path(args.salida) / 'lecturas_adquiridas.json', medidas)
+    lecturas = asociar_lecturas_anclas(anclas, medidas)
+    resultados['lecturas_anclas'] = lecturas
+    log('Lecturas asociadas EXCLUSIVAMENTE por BSSID registrado:')
+    for a in lecturas:
+        log(f'  {a["id_ancla"]}: RSSI={a["rssi_efectivo_dbm"]:.2f} dBm, '
+            f'sigma={a["sigma_rssi_db"]} dB, BSSID={a["bssid"]}')
+
+    calibracion = next((a for a in lecturas if a['id_ancla'] == args.ancla_calibracion), None)
+    if calibracion is None:
+        raise ValueError(f'La ancla de calibracion {args.ancla_calibracion!r} no figura en --anclas.')
+    fcal = construir_ecuacion_calibracion_n(calibracion['rssi_efectivo_dbm'], args.d_ref,
+                                            args.pt_dbm, args.pl_d0, args.alpha, args.d0)
+    ref_n = root_scalar(fcal, x0=args.n0_secante, x1=args.n1_secante, method='secant')
+    if not ref_n.converged:
+        raise RuntimeError('SciPy no pudo calibrar el exponente n.')
+    n, hist_n = metodo_secante(fcal, args.n0_secante, args.n1_secante,
+                              args.tol, args.max_iter, ref_n.root)
+    if n <= 0:
+        raise ValueError(f'n calibrado = {n:.4f} (no positivo). Revise parametros fisicos y RSSI.')
+    log(f'Exponente de propagacion n={n:.8f}, referencia SciPy={ref_n.root:.8f}')
+
+    distancias = []
+    historias = {}
+    propagacion = []
+    x0 = args.d0_secante if args.d0_secante is not None else args.bis_a + .25*(args.bis_b-args.bis_a)
+    x1 = args.d1_secante if args.d1_secante is not None else args.bis_a + .50*(args.bis_b-args.bis_a)
+    newton0 = args.d0_newton if args.d0_newton is not None else args.d_ref
+    for a in lecturas:
+        fun, derivada = construir_ecuacion_distancia(a['rssi_efectivo_dbm'],
+                        args.pt_dbm, args.pl_d0, n, args.alpha, args.d0)
+        fa, fb = fun(args.bis_a), fun(args.bis_b)
+        if fa * fb >= 0:
+            raise ValueError(f'La raiz del ancla {a["id_ancla"]} queda fuera de '
+                             f'[{args.bis_a}, {args.bis_b}]. Revise el intervalo/mediciones.')
+        ref = root_scalar(fun, bracket=[args.bis_a, args.bis_b], method='brentq').root
+        bis, hb = metodo_biseccion(fun, args.bis_a, args.bis_b, args.tol, args.max_iter, ref)
+        sec, hs = metodo_secante(fun, x0, x1, args.tol, args.max_iter, ref)
+        nr, hn = metodo_newton_raphson(fun, derivada, newton0, args.tol, args.max_iter, ref)
+        distancias.append(sec)
+        historias[a['id_ancla']] = {'biseccion': hb, 'secante': hs, 'newton_raphson': hn}
+        sigma = a['sigma_rssi_db']
+        delta = sigma / abs(derivada(sec)) if sigma is not None else None
+        propagacion.append({'id_ancla': a['id_ancla'], 'd_m': sec, 'sigma_rssi_db': sigma,
+                            'propagacion_delta_m': delta})
+        log(f'{a["id_ancla"]}: Biseccion={bis:.6f} m ({len(hb)} iter), '
+            f'Secante={sec:.6f} m ({len(hs)} iter), Newton={nr:.6f} m ({len(hn)} iter), '
+            f'±delta={delta if delta is not None else "no calculable: falta sigma"}')
+
+    A, B, M, C = ensamblar_sistema_trilateracion([a['coordenadas'] for a in lecturas], distancias)
+    cond = calcular_numero_condicion(M)
+    referencia = solve(M, C)
+    if args.semilla_x is not None and args.semilla_y is not None:
+        semilla = np.array([args.semilla_x, args.semilla_y], dtype=float)
+    elif args.semilla_x is None and args.semilla_y is None:
+        semilla = np.mean([a['coordenadas'] for a in lecturas], axis=0)
+    else:
+        raise ValueError('Para la semilla debe pasar --semilla-x Y --semilla-y, o ninguna.')
+    gs, hgs, dom = gauss_seidel(M, C, semilla, args.tol, args.max_iter, referencia)
+    jac, hjac = metodo_jacobi(M, C, semilla, args.tol, args.max_iter, referencia)
+    gauss = eliminacion_gaussiana_pivoteo(M, C)
+    log(f'M = {M.tolist()}, C = {C.tolist()}')
+    log(f'Condicion inf={cond:.6f} | Diagonal dominante={dom[0]} ({dom[1]})')
+    log(f'GS: {gs.tolist()} | Jacobi: {jac.tolist()} | Pivoteo: {gauss.tolist()}')
+    log(f'SciPy: {referencia.tolist()} | error GS vs SciPy: {error_absoluto(gs, referencia):.3e} m')
+    resultados['numerico'] = {
+        'n_calibrado': n, 'n_ref_scipy': ref_n.root, 'historial_calibracion': hist_n,
+        'distancias': propagacion, 'historiales_distancias': historias,
+        'A': A.tolist(), 'B': B.tolist(), 'M': M.tolist(), 'C': C.tolist(),
+        'condicion_infinito': cond, 'diagonal_dominante': dom[0],
+        'semilla_xy': semilla.tolist(), 'gauss_seidel': gs.tolist(),
+        'jacobi': jac.tolist(), 'gauss_pivoteo': gauss.tolist(),
+        'referencia_scipy': referencia.tolist(),
+        'error_gs_scipy_m': error_absoluto(gs, referencia),
+        'historial_gauss_seidel': hgs, 'historial_jacobi': hjac,
+        'nota': 'Error frente a SciPy es numerico, NO error de posicion frente a verdad terreno.'}
+    primer = lecturas[0]['id_ancla']
+    graficar_convergencia(historias[primer], f'Convergencia en {primer}',
+                         Path(args.salida) / 'grafica_1_convergencia_no_lineal.png')
+    graficar_convergencia({'Gauss-Seidel': hgs, 'Jacobi': hjac}, 'Convergencia 2D',
+                         Path(args.salida) / 'grafica_2_convergencia_sistemas_lineales.png')
+    graficar_mapa(lecturas, distancias, gs,
+                 Path(args.salida) / 'grafica_3_mapa_trilateracion_iot.png')
+    log('Graficas numericas generadas y guardadas en carpeta de salida.')
+    return gs
+
+
+def main():
+    args = argumentos()
+    salida = Path(args.salida)
+    salida.mkdir(parents=True, exist_ok=True)
+    mensajes = []
+    resultado = {'fecha_utc': datetime.now(timezone.utc).isoformat(),
+                 'modo': args.modo, 'estado': 'en_ejecucion',
+                 'configuracion_cli': vars(args),
+                 'epsilon_maquina': calcular_epsilon_maquina(),
+                 'advertencias': []}
+    def log(mensaje):
+        texto = str(mensaje)
+        print(texto, flush=True)
+        mensajes.append(texto)
+    log(f'Proyecto IoT / {args.modo} - {resultado["fecha_utc"]}')
+    log(f'Epsilon de maquina: {resultado["epsilon_maquina"]:.9e}')
+    codigo = 0
+    posicion = None
+    try:
+        if args.modo == 'diagnostico':
+            diagnostico(args, log, resultado)
+        else:
+            posicion = localizacion(args, log, resultado)
+        resultado['estado_numerico_red'] = 'completado'
+        if args.modo == 'diagnostico' and (resultado.get('error_wifi') or resultado.get('error_lan')):
+            codigo = 1
+            resultado['estado_numerico_red'] = 'diagnostico_parcial'
+    except Exception as exc:
+        codigo = 1
+        resultado['estado_numerico_red'] = 'fallo'
+        resultado['error_numerico_red'] = str(exc)
+        log(f'[ERROR ETAPA DE RED / CALCULO] {exc}')
+        log(traceback.format_exc())
+    if not args.omitir_camara:
+        log('Iniciando comprobacion de webcam fisica...')
+        try:
+            rep_cam = config_camara(args, posicion)
+            resultado['camara'] = rep_cam
+            log(f'Camara: {rep_cam["estado"]} | frames={rep_cam["frames_analizados"]} '
+                f'| captura={rep_cam["archivo_evidencia"]}')
+            if rep_cam['coordenada_visual_m'] is None:
+                log('No se calcularon metros desde pixeles: falta deteccion y/o calibracion geometrica.')
+            else:
+                log(f'Posicion visual CALIBRADA={rep_cam["coordenada_visual_m"]} m '
+                    f'| diferencia={rep_cam["discrepancia_wifi_camara_m"]} m')
+        except Exception as exc:
+            codigo = 1
+            resultado['camara'] = {'estado': 'error', 'mensaje': str(exc)}
+            log(f'[ERROR CAMARA] {exc}')
+            log(traceback.format_exc())
+    else:
+        resultado['camara'] = {'estado': 'omitida_por_usuario'}
+    resultado['estado'] = 'completado' if codigo == 0 else 'parcial_con_errores'
+    guardar_json(salida / 'resultados.json', resultado)
+    (salida / 'reporte_ejecucion.txt').write_text('\n'.join(mensajes) + '\n', encoding='utf-8')
+    log(f'Reporte guardado: {salida / "reporte_ejecucion.txt"}')
+    log(f'JSON guardado: {salida / "resultados.json"}')
+    return codigo
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

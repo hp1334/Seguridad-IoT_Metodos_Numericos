@@ -1,0 +1,28 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Datos personales y configuraciones
+.env
+.env.*
+.vscode/
+anclas.json
+lecturas.json
+camara_calibracion.json
+
+# Evidencias locales
+resultados/
+resultados_localizacion/
+*.log
+captura_camara_real.png
+evidencia_camara_fedora.png
+grafica_*.png
+resultados_informe.txt
+
+# Respaldos
+*.respaldo
+*.respaldo/
+src.respaldo/
