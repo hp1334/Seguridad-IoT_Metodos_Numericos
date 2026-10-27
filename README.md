@@ -144,3 +144,14 @@ Estas pruebas de control utilizan datos matemáticos *de prueba*, no evidencias 
 - El error respecto a SciPy valida algoritmos numéricos pero no es error de posicionamiento absoluto contra un sistema de verdad terreno.
 - La trilateración estima la posición del **receptor Wi-Fi** frente a anclas fijas, no la posición de una persona observada por la cámara a menos que se diseñe expresamente un experimento con un objetivo común y se valide la geometría.
 - El prototipo necesita verificación de mediciones de energía/potencia, fuentes RSSI y parámetros del canal para convertirse en una prueba física reproducible.
+
+## ESP32: firmware de captura RSSI del Grupo 1
+
+El sketch del equipo está publicado en [esp32/ESP32_Ancla_IoT/ESP32_Ancla_IoT.ino](esp32/ESP32_Ancla_IoT/ESP32_Ancla_IoT.ino). Configura un punto de acceso local y recibe tramas Wi-Fi mediante la función `esp_wifi_set_promiscuous_rx_cb`. Su salida serial utiliza el formato `SNIFF,MAC,RSSI` a 115200 baudios, compatible con el protocolo de adquisición del proyecto. El receptor escucha su canal operativo, por lo que el canal debe elegirse según el montaje experimental.
+
+1. Instala Arduino IDE y el soporte de placas ESP32 by Espressif Systems. Selecciona el modelo y puerto USB correctos.
+2. Copia [configuracion_local.example.h](esp32/ESP32_Ancla_IoT/configuracion_local.example.h) como `esp32/ESP32_Ancla_IoT/configuracion_local.h`. Establece `AP_SSID`, `AP_PASSWORD` (8–63 caracteres) y `AP_CHANNEL` conforme a tu práctica. **No publiques el archivo local de credenciales:** está incluido en `.gitignore`.
+3. Abre y carga `ESP32_Ancla_IoT.ino`. En el monitor serial a 115200 baudios, verifica el mensaje de inicio `ESP32_LISTO,CANAL,N` y las líneas `SNIFF,AA:BB:CC:DD:EE:FF,-65` cuando existan paquetes observables.
+4. Cierra el monitor serial antes de ejecutar Python; identifica el puerto con `python -m serial.tools.list_ports -v`. En Fedora suele ser `/dev/ttyUSB0` o `/dev/ttyACM0`; en Windows, `COM3`, `COM4`, etc.
+
+El firmware proporciona potencia RSSI por trama y dirección de origen observada. El cálculo de coordenadas métricas requiere además una configuración de anclas no colineales, posiciones físicas y datos de calibración para el mismo objetivo. El protocolo del ESP32 y el modelo de trilateración son etapas complementarias del prototipo.
